@@ -1,0 +1,8 @@
+pip install anthropic openai google-generativeai requests
+
+# Configurez vos clés API dans le script ou en variables d'environnement
+export ANTHROPIC_API_KEY="sk-ant-..."
+export OPENAI_API_KEY="sk-..."
+export GEMINI_API_KEY="AIza..."
+
+python benchmark.py
