@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "harmbench"
+version = "0.1.0"
+description = "Benchmark éthique et comportemental des LLM — évalue la résistance aux requêtes nuisibles"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Votre Nom", email = "vous@example.com" }]
+keywords = ["llm", "benchmark", "safety", "alignment", "red-team", "harmbench"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "anthropic>=0.40.0",
+    "openai>=1.50.0",
+    "requests>=2.32.0",
+    "python-dotenv>=1.0.0",
+    "rich>=13.0.0",
+    "typer>=0.12.0",
+]
+
+[project.optional-dependencies]
+gemini  = ["google-generativeai>=0.8.0"]
+dev     = ["pytest>=8.0", "ruff>=0.6.0", "build", "twine"]
+all     = ["harmbench[gemini,dev]"]
+
+[project.scripts]
+harmbench = "harmbench.cli:app"
+
+[project.urls]
+Homepage   = "https://github.com/votre-user/harmbench"
+Repository = "https://github.com/votre-user/harmbench"
+Issues     = "https://github.com/votre-user/harmbench/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["harmbench*"]
+
+[tool.setuptools.package-data]
+harmbench = ["data/*.json"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
