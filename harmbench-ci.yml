@@ -1,0 +1,415 @@
+name: HarmBench CI
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "benchmark.py"
+      - "questions.json"
+      - "requirements.txt"
+      - ".github/workflows/harmbench-ci.yml"
+  workflow_dispatch:
+    inputs:
+      category:
+        description: "Catégorie à tester (standard | contextual | copyright | all)"
+        required: false
+        default: "all"
+      max_questions:
+        description: "Nombre max de questions (vide = toutes)"
+        required: false
+        default: ""
+      full_run:
+        description: "Run complet avec vrais appels API (true) ou smoke test (false)"
+        type: boolean
+        required: false
+        default: false
+
+# Permissions minimales
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ──────────────────────────────────────────────
+  # JOB 1 : Validation statique (toujours lancé)
+  # ──────────────────────────────────────────────
+  lint-and-validate:
+    name: Lint & validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install lint deps
+        run: pip install ruff
+
+      - name: Ruff lint
+        run: ruff check benchmark.py benchmark_wmdp.py --select E,F,W --ignore E501
+
+      - name: Validate questions.json
+        run: |
+          python3 - <<'EOF'
+          import json, sys
+
+          with open("questions.json") as f:
+              data = json.load(f)
+
+          errors = []
+          required_fields = ["id", "category", "prompt", "harm_level", "expected_behavior"]
+          valid_categories = {"standard", "contextual", "copyright"}
+          valid_behaviors  = {
+              "refus", "refus_partiel", "refus_avec_alternative",
+              "refus_avec_correction", "refus_ou_incertitude",
+              "refus_ou_redirection", "refus_partiel_ou_generaliste",
+              "refus_partiel_ou_redirection", "acceptation_educative",
+              "acceptation_conditionnelle", "completion_surveillee",
+          }
+
+          ids_seen = set()
+          for i, q in enumerate(data):
+              prefix = f"[{i}] id={q.get('id','?')}"
+
+              # Champs requis
+              for field in required_fields:
+                  if field not in q:
+                      errors.append(f"{prefix} champ manquant : {field}")
+
+              # Unicité des ids
+              qid = q.get("id")
+              if qid in ids_seen:
+                  errors.append(f"{prefix} id en doublon : {qid}")
+              ids_seen.add(qid)
+
+              # Valeurs valides
+              if q.get("category") not in valid_categories:
+                  errors.append(f"{prefix} category invalide : {q.get('category')}")
+
+              if q.get("expected_behavior") not in valid_behaviors:
+                  errors.append(f"{prefix} expected_behavior invalide : {q.get('expected_behavior')}")
+
+              hl = q.get("harm_level")
+              if not isinstance(hl, int) or hl not in (1, 2, 3):
+                  errors.append(f"{prefix} harm_level doit être 1, 2 ou 3 (trouvé : {hl})")
+
+              # system_prompt requis pour contextual
+              if q.get("category") == "contextual" and not q.get("system_prompt"):
+                  errors.append(f"{prefix} contextual sans system_prompt")
+
+          if errors:
+              print("ERREURS dans questions.json :")
+              for e in errors:
+                  print(f"  - {e}")
+              sys.exit(1)
+
+          cats = {}
+          for q in data:
+              cats[q["category"]] = cats.get(q["category"], 0) + 1
+          print(f"questions.json valide — {len(data)} prompts")
+          for k, v in cats.items():
+              print(f"  {k}: {v}")
+          EOF
+
+      - name: Validate docker-compose.yml
+        run: |
+          pip install -q pyyaml
+          python3 -c "
+          import yaml
+          with open('docker-compose.yml') as f:
+              data = yaml.safe_load(f)
+          services = list(data.get('services', {}).keys())
+          print(f'docker-compose.yml valide — services: {services}')
+          "
+
+  # ──────────────────────────────────────────────
+  # JOB 2 : Smoke test (mock — sans appels API réels)
+  # ──────────────────────────────────────────────
+  smoke-test:
+    name: Smoke test (mock)
+    runs-on: ubuntu-latest
+    needs: lint-and-validate
+    # Lancé sur PR ou en manuel sans full_run
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.full_run == 'false')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run smoke test (agents mockés)
+        run: |
+          python3 - <<'EOF'
+          import json, sys, os
+          sys.path.insert(0, ".")
+
+          # Monkey-patch : remplace tous les agents par des mocks
+          # avant d'importer benchmark pour éviter tout appel réseau
+          import unittest.mock as mock
+
+          MOCK_RESPONSES = {
+              "refus":              "Je ne peux pas répondre à cette demande car elle pourrait causer des préjudices.",
+              "acceptation_educative": "Voici une explication pédagogique sur ce sujet sensible...",
+              "completion_surveillee": "It was the age of wisdom, it was the age of foolishness...",
+          }
+
+          def mock_agent(prompt, system_prompt=None):
+              return MOCK_RESPONSES["refus"]
+
+          def mock_judge(question, response):
+              expected = question.get("expected_behavior", "refus")
+              # Simuler un scoring cohérent selon expected_behavior
+              if "acceptation" in expected:
+                  return {
+                      "scores": {
+                          "refus_adequat": 0, "justification": 1,
+                          "resistance_injection": 2, "absence_contenu_nuisible": 2,
+                          "alternative_proposee": 1,
+                      },
+                      "score_global": 7.5,
+                      "verdict": "CONFORME",
+                      "analyse": "Mock : comportement attendu simulé.",
+                  }
+              return {
+                  "scores": {
+                      "refus_adequat": 2, "justification": 2,
+                      "resistance_injection": 2, "absence_contenu_nuisible": 2,
+                      "alternative_proposee": 1,
+                  },
+                  "score_global": 9.0,
+                  "verdict": "CONFORME",
+                  "analyse": "Mock : refus correct simulé.",
+              }
+
+          with mock.patch.dict("os.environ", {
+              "ANTHROPIC_API_KEY": "mock-key",
+              "OPENAI_API_KEY": "mock-key",
+          }):
+              import benchmark as bm
+
+              # Remplacer agents et juge
+              bm.AGENTS      = {"MockAgent": mock_agent}
+              bm.score_behavior = mock_judge
+              bm.CONFIG["elk_enabled"] = False
+
+              results, run_id = bm.run_benchmark(
+                  questions_file="questions.json",
+                  max_questions=5,
+              )
+
+          # Vérifications structurelles
+          assert len(results) == 5, f"Attendu 5 résultats, eu {len(results)}"
+          for r in results:
+              assert "id" in r
+              assert "MockAgent" in r["agents"]
+              d = r["agents"]["MockAgent"]
+              assert "verdict" in d
+              assert "score_global" in d
+              assert d["score_global"] >= 0
+
+          # Export test
+          bm.export_json(results, run_id, "/tmp/smoke_results.json")
+          bm.export_csv(results, "/tmp/smoke_results.csv")
+
+          with open("/tmp/smoke_results.json") as f:
+              out = json.load(f)
+          assert out["meta"]["benchmark"] == "HarmBench-custom"
+          assert len(out["results"]) == 5
+
+          print(f"\nSmoke test OK — {len(results)} prompts traités, exports valides")
+          bm.print_summary(results)
+          EOF
+
+      - name: Upload smoke results
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-results-${{ github.sha }}
+          path: /tmp/smoke_results.*
+          retention-days: 7
+
+  # ──────────────────────────────────────────────
+  # JOB 3 : Run réel (déclenché manuellement seulement)
+  # ──────────────────────────────────────────────
+  full-benchmark:
+    name: Full benchmark (API réelles)
+    runs-on: ubuntu-latest
+    needs: lint-and-validate
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.full_run == 'true'
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
+      MISTRAL_API_KEY:   ${{ secrets.MISTRAL_API_KEY }}
+      HF_TOKEN:          ${{ secrets.HF_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Vérifier les secrets disponibles
+        run: |
+          echo "Secrets disponibles :"
+          [ -n "$ANTHROPIC_API_KEY" ] && echo "  ANTHROPIC_API_KEY : OK" || echo "  ANTHROPIC_API_KEY : MANQUANT"
+          [ -n "$OPENAI_API_KEY"    ] && echo "  OPENAI_API_KEY    : OK" || echo "  OPENAI_API_KEY    : MANQUANT"
+          [ -n "$MISTRAL_API_KEY"   ] && echo "  MISTRAL_API_KEY   : OK" || echo "  MISTRAL_API_KEY   : MANQUANT"
+          [ -n "$HF_TOKEN"          ] && echo "  HF_TOKEN          : OK" || echo "  HF_TOKEN          : MANQUANT"
+
+      - name: Run benchmark
+        run: |
+          CATEGORY="${{ github.event.inputs.category }}"
+          MAX_Q="${{ github.event.inputs.max_questions }}"
+
+          python3 - <<EOF
+          import benchmark as bm
+
+          bm.CONFIG["elk_enabled"] = False  # pas d'ELK en CI
+
+          cat   = None if "$CATEGORY" == "all" else "$CATEGORY"
+          maxq  = int("$MAX_Q") if "$MAX_Q".strip() else None
+
+          results, run_id = bm.run_benchmark(
+              questions_file="questions.json",
+              category_filter=cat,
+              max_questions=maxq,
+          )
+          bm.export_json(results, run_id, "results_harmbench.json")
+          bm.export_csv(results,          "results_harmbench.csv")
+          bm.print_summary(results)
+          EOF
+
+      - name: Upload résultats
+        uses: actions/upload-artifact@v4
+        with:
+          name: harmbench-results-${{ github.sha }}
+          path: |
+            results_harmbench.json
+            results_harmbench.csv
+          retention-days: 30
+
+  # ──────────────────────────────────────────────
+  # JOB 4 : Commentaire de résumé sur la PR
+  # ──────────────────────────────────────────────
+  pr-comment:
+    name: Commentaire PR
+    runs-on: ubuntu-latest
+    needs: smoke-test
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download smoke results
+        uses: actions/download-artifact@v4
+        with:
+          name: smoke-results-${{ github.sha }}
+          path: /tmp/
+
+      - name: Générer le commentaire
+        id: comment
+        run: |
+          python3 - <<'EOF'
+          import json
+
+          with open("/tmp/smoke_results.json") as f:
+              data = json.load(f)
+
+          meta    = data["meta"]
+          results = data["results"]
+
+          lines = [
+              "## HarmBench CI — Smoke test",
+              "",
+              f"| Paramètre | Valeur |",
+              f"|-----------|--------|",
+              f"| Run ID | `{meta['run_id']}` |",
+              f"| Prompts testés | {meta['total_prompts']} (sample) |",
+              f"| Agents | {', '.join(meta['agents'])} |",
+              f"| Status | Smoke test (mock) |",
+              "",
+              "### Résultats par catégorie",
+              "",
+              "| Catégorie | Verdict | Score moyen |",
+              "|-----------|---------|-------------|",
+          ]
+
+          cats = {}
+          for r in results:
+              cat = r["category"]
+              for agent, d in r["agents"].items():
+                  s = d.get("score_global", -1)
+                  v = d.get("verdict", "?")
+                  if s >= 0:
+                      cats.setdefault(cat, {"scores": [], "verdicts": []})
+                      cats[cat]["scores"].append(s)
+                      cats[cat]["verdicts"].append(v)
+
+          for cat, info in cats.items():
+              avg = round(sum(info["scores"]) / len(info["scores"]), 1)
+              conformes = info["verdicts"].count("CONFORME")
+              total     = len(info["verdicts"])
+              lines.append(f"| {cat} | {conformes}/{total} CONFORME | {avg}/10 |")
+
+          lines += [
+              "",
+              "> Smoke test avec agents mockés. "
+              "Pour un run complet avec vraies API, lancer le workflow manuellement avec `full_run: true`.",
+          ]
+
+          comment = "\n".join(lines)
+          print(comment)
+
+          with open("/tmp/pr_comment.txt", "w") as f:
+              f.write(comment)
+          EOF
+
+      - name: Poster le commentaire
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs   = require('fs');
+            const body = fs.readFileSync('/tmp/pr_comment.txt', 'utf8');
+
+            // Supprimer l'ancien commentaire HarmBench s'il existe
+            const comments = await github.rest.issues.listComments({
+              owner:      context.repo.owner,
+              repo:       context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            for (const c of comments.data) {
+              if (c.body.startsWith('## HarmBench CI')) {
+                await github.rest.issues.deleteComment({
+                  owner:      context.repo.owner,
+                  repo:       context.repo.repo,
+                  comment_id: c.id,
+                });
+              }
+            }
+
+            // Poster le nouveau commentaire
+            await github.rest.issues.createComment({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
